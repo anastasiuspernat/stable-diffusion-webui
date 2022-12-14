@@ -237,7 +237,7 @@ class VanillaStableDiffusionSampler:
         
         return num_steps
 
-    def sample_img2img(self, p, x, noise, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
+    def sample_img2img(self, p, x, noise, conditioning, unconditional_conditioning, steps=None, image_conditioning=None, mimic_scale=None, threshold_enable=False):
         steps, t_enc = setup_img2img_steps(p, steps)
         steps = self.adjust_steps_if_invalid(p, steps)
         self.initialize(p)
@@ -259,7 +259,7 @@ class VanillaStableDiffusionSampler:
 
         return samples
 
-    def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
+    def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning=None, mimic_scale=None, threshold_enable=False):
         self.initialize(p)
 
         self.init_latent = None
@@ -288,7 +288,39 @@ class CFGDenoiser(torch.nn.Module):
         self.init_latent = None
         self.step = 0
 
-    def forward(self, x, sigma, uncond, cond, cond_scale, image_cond):
+    def _dynthresh(self, cond, uncond, cond_scale, conds_list, mimic_scale):
+        # uncond shape is (batch, 4, height, width)
+        conds_per_batch = cond.shape[0] / uncond.shape[0]
+        assert conds_per_batch == int(conds_per_batch), "Expected # of conds per batch to be constant across batches"
+        cond_stacked = cond.reshape((-1, int(conds_per_batch)) + uncond.shape[1:])
+        diff = cond_stacked - uncond.unsqueeze(1)
+        # conds_list shape is (batch, cond, 2)
+        weights = torch.tensor(conds_list).select(2, 1)
+        weights = weights.reshape(*weights.shape, 1, 1, 1).to(diff.device)
+        diff_weighted = (diff * weights).sum(1)
+        dynthresh_target = uncond + diff_weighted * mimic_scale
+        
+        dt_flattened = dynthresh_target.flatten(2)
+        dt_means = dt_flattened.mean(dim=2).unsqueeze(2)
+        dt_recentered = dt_flattened - dt_means
+        dt_max = dt_recentered.abs().max(dim=2).values.unsqueeze(2)
+
+        ut = uncond + diff_weighted * cond_scale
+        ut_flattened = ut.flatten(2)
+        ut_means = ut_flattened.mean(dim=2).unsqueeze(2)
+        ut_centered = ut_flattened - ut_means
+
+        ut_q = torch.quantile(ut_centered.abs(), opts.dynamic_threshold_percentile, dim=2).unsqueeze(2)
+        s = torch.maximum(ut_q, dt_max)
+        t_clamped = ut_centered.clamp(-s, s)
+        t_normalized = t_clamped / s
+        t_renormalized = t_normalized * dt_max
+
+        uncentered = t_renormalized + ut_means
+        unflattened = uncentered.unflatten(2, dynthresh_target.shape[2:])
+        return unflattened
+
+    def forward(self, x, sigma, uncond, cond, cond_scale, image_cond, mimic_scale, threshold_enable):
         if state.interrupted or state.skipped:
             raise InterruptedException
 
@@ -330,11 +362,14 @@ class CFGDenoiser(torch.nn.Module):
             x_out[-uncond.shape[0]:] = self.inner_model(x_in[-uncond.shape[0]:], sigma_in[-uncond.shape[0]:], cond={"c_crossattn": [uncond], "c_concat": [image_cond_in[-uncond.shape[0]:]]})
 
         denoised_uncond = x_out[-uncond.shape[0]:]
-        denoised = torch.clone(denoised_uncond)
+        if threshold_enable:
+            denoised = self._dynthresh(x_out[:-uncond.shape[0]], denoised_uncond, cond_scale, conds_list, mimic_scale)
+        else:
+            denoised = torch.clone(denoised_uncond)
 
-        for i, conds in enumerate(conds_list):
-            for cond_index, weight in conds:
-                denoised[i] += (x_out[cond_index] - denoised_uncond[i]) * (weight * cond_scale)
+            for i, conds in enumerate(conds_list):
+                for cond_index, weight in conds:
+                    denoised[i] += (x_out[cond_index] - denoised_uncond[i]) * (weight * cond_scale)
 
         if self.mask is not None:
             denoised = self.init_latent * self.mask + self.nmask * denoised
@@ -444,7 +479,7 @@ class KDiffusionSampler:
 
         return extra_params_kwargs
 
-    def sample_img2img(self, p, x, noise, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
+    def sample_img2img(self, p, x, noise, conditioning, unconditional_conditioning, steps=None, image_conditioning=None, mimic_scale=None, threshold_enable=False):
         steps, t_enc = setup_img2img_steps(p, steps)
 
         if p.sampler_noise_scheduler_override:
@@ -477,12 +512,14 @@ class KDiffusionSampler:
             'cond': conditioning, 
             'image_cond': image_conditioning, 
             'uncond': unconditional_conditioning, 
-            'cond_scale': p.cfg_scale
+            'cond_scale': p.cfg_scale,
+            'mimic_scale': mimic_scale,
+            'threshold_enable': threshold_enable,
         }, disable=False, callback=self.callback_state, **extra_params_kwargs))
 
         return samples
 
-    def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning = None):
+    def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning=None, mimic_scale=None, threshold_enable=False):
         steps = steps or p.steps
 
         if p.sampler_noise_scheduler_override:
@@ -508,7 +545,9 @@ class KDiffusionSampler:
             'cond': conditioning, 
             'image_cond': image_conditioning, 
             'uncond': unconditional_conditioning, 
-            'cond_scale': p.cfg_scale
+            'cond_scale': p.cfg_scale,
+            'mimic_scale': mimic_scale,
+            'threshold_enable': threshold_enable,
         }, disable=False, callback=self.callback_state, **extra_params_kwargs))
 
         return samples
