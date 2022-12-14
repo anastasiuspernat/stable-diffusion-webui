@@ -31,4 +31,6 @@ inflection
 GitPython
 torchsde
 safetensors
+aenum
+blendmodes
 psutil; sys_platform == 'darwin'

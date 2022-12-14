@@ -730,7 +730,13 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             for i in range(samples.shape[0]):
                 save_intermediate(samples, i)
 
-            samples = torch.nn.functional.interpolate(samples, size=(self.height // opt_f, self.width // opt_f), mode="bilinear")
+            # LATENT UPSCALE MOD https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/4446
+            # Note that it's enabled in settings
+            # samples = torch.nn.functional.interpolate(samples, size=(self.height // opt_f, self.width // opt_f), mode="bilinear")
+            print("!!!!!!!!!!!!!!!!!! UPSCALING LATENT !!!!!!!!!!!!!!!!!!!!!")
+            print(prompts)
+            samples=run_sdu_latent_upscale(samples,prompts[0], size=(self.height // opt_f, self.width // opt_f) )
+            print("!!!!!!!!!!!!!!!!!! UPSCALING DONE !!!!!!!!!!!!!!!!!!!!!")
 
             # Avoid making the inpainting conditioning unless necessary as 
             # this does need some extra compute to decode / encode the image again.
