@@ -27,6 +27,7 @@ from ldm.data.util import AddMiDaS
 from ldm.models.diffusion.ddpm import LatentDepth2ImageDiffusion
 
 from einops import repeat, rearrange
+from blendmodes.blend import blendLayers, BlendType
 
 # some of those options should not be changed at all because they would break the model, so I removed them from options.
 opt_C = 4
@@ -39,17 +40,19 @@ def setup_color_correction(image):
     return correction_target
 
 
-def apply_color_correction(correction, image):
+def apply_color_correction(correction, original_image):
     logging.info("Applying color correction.")
     image = Image.fromarray(cv2.cvtColor(exposure.match_histograms(
         cv2.cvtColor(
-            np.asarray(image),
+            np.asarray(original_image),
             cv2.COLOR_RGB2LAB
         ),
         correction,
         channel_axis=2
     ), cv2.COLOR_LAB2RGB).astype("uint8"))
-
+    
+    image = blendLayers(image, original_image, BlendType.LUMINOSITY)
+    
     return image
 
 
@@ -77,7 +80,7 @@ class StableDiffusionProcessing():
     """
     The first set of paramaters: sd_models -> do_not_reload_embeddings represent the minimum required to create a StableDiffusionProcessing
     """
-    def __init__(self, sd_model=None, outpath_samples=None, outpath_grids=None, prompt: str = "", styles: List[str] = None, seed: int = -1, subseed: int = -1, subseed_strength: float = 0, seed_resize_from_h: int = -1, seed_resize_from_w: int = -1, seed_enable_extras: bool = True, sampler_name: str = None, batch_size: int = 1, n_iter: int = 1, steps: int = 50, cfg_scale: float = 7.0, width: int = 512, height: int = 512, restore_faces: bool = False, tiling: bool = False, do_not_save_samples: bool = False, do_not_save_grid: bool = False, extra_generation_params: Dict[Any, Any] = None, overlay_images: Any = None, negative_prompt: str = None, eta: float = None, do_not_reload_embeddings: bool = False, denoising_strength: float = 0, ddim_discretize: str = None, s_churn: float = 0.0, s_tmax: float = None, s_tmin: float = 0.0, s_noise: float = 1.0, override_settings: Dict[str, Any] = None, sampler_index: int = None):
+    def __init__(self, sd_model=None, outpath_samples=None, outpath_grids=None, prompt: str = "", styles: List[str] = None, seed: int = -1, subseed: int = -1, subseed_strength: float = 0, seed_resize_from_h: int = -1, seed_resize_from_w: int = -1, seed_enable_extras: bool = True, sampler_name: str = None, batch_size: int = 1, n_iter: int = 1, steps: int = 50, cfg_scale: float = 7.0, mimic_scale: float = 7.5, threshold_enable: bool = False, width: int = 512, height: int = 512, restore_faces: bool = False, tiling: bool = False, do_not_save_samples: bool = False, do_not_save_grid: bool = False, extra_generation_params: Dict[Any, Any] = None, overlay_images: Any = None, negative_prompt: str = None, eta: float = None, do_not_reload_embeddings: bool = False, denoising_strength: float = 0, ddim_discretize: str = None, s_churn: float = 0.0, s_tmax: float = None, s_tmin: float = 0.0, s_noise: float = 1.0, override_settings: Dict[str, Any] = None, sampler_index: int = None):
         if sampler_index is not None:
             print("sampler_index argument for StableDiffusionProcessing does not do anything; use sampler_name", file=sys.stderr)
 
@@ -98,6 +101,8 @@ class StableDiffusionProcessing():
         self.n_iter: int = n_iter
         self.steps: int = steps
         self.cfg_scale: float = cfg_scale
+        self.mimic_scale: float = mimic_scale
+        self.threshold_enable: float = threshold_enable
         self.width: int = width
         self.height: int = height
         self.restore_faces: bool = restore_faces
@@ -125,6 +130,9 @@ class StableDiffusionProcessing():
             self.subseed_strength = 0
             self.seed_resize_from_h = 0
             self.seed_resize_from_w = 0
+
+        if not threshold_enable:
+            self.mimic_scale = 0
 
         self.scripts = None
         self.script_args = None
@@ -247,6 +255,7 @@ class Processed:
         self.height = p.height
         self.sampler_name = p.sampler_name
         self.cfg_scale = p.cfg_scale
+        self.mimic_scale = p.mimic_scale
         self.steps = p.steps
         self.batch_size = p.batch_size
         self.restore_faces = p.restore_faces
@@ -295,6 +304,7 @@ class Processed:
             "height": self.height,
             "sampler_name": self.sampler_name,
             "cfg_scale": self.cfg_scale,
+            "mimic_scale": self.mimic_scale,
             "steps": self.steps,
             "batch_size": self.batch_size,
             "restore_faces": self.restore_faces,
@@ -440,6 +450,8 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments, iteration
         "Eta": (None if p.sampler is None or p.sampler.eta == p.sampler.default_eta else p.sampler.eta),
         "Clip skip": None if clip_skip <= 1 else clip_skip,
         "ENSD": None if opts.eta_noise_seed_delta == 0 else opts.eta_noise_seed_delta,
+        "Mimic CFG scale": None if not p.threshold_enable else p.mimic_scale,
+        "Threshold percentile": None if not p.threshold_enable else opts.dynamic_threshold_percentile,
     }
 
     generation_params.update(p.extra_generation_params)
@@ -696,11 +708,11 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         if not self.enable_hr:
             x = create_random_tensors([opt_C, self.height // opt_f, self.width // opt_f], seeds=seeds, subseeds=subseeds, subseed_strength=self.subseed_strength, seed_resize_from_h=self.seed_resize_from_h, seed_resize_from_w=self.seed_resize_from_w, p=self)
-            samples = self.sampler.sample(self, x, conditioning, unconditional_conditioning, image_conditioning=self.txt2img_image_conditioning(x))
+            samples = self.sampler.sample(self, x, conditioning, unconditional_conditioning, image_conditioning=self.txt2img_image_conditioning(x), mimic_scale=self.mimic_scale, threshold_enable=self.threshold_enable)
             return samples
 
         x = create_random_tensors([opt_C, self.firstphase_height // opt_f, self.firstphase_width // opt_f], seeds=seeds, subseeds=subseeds, subseed_strength=self.subseed_strength, seed_resize_from_h=self.seed_resize_from_h, seed_resize_from_w=self.seed_resize_from_w, p=self)
-        samples = self.sampler.sample(self, x, conditioning, unconditional_conditioning, image_conditioning=self.txt2img_image_conditioning(x, self.firstphase_width, self.firstphase_height))
+        samples = self.sampler.sample(self, x, conditioning, unconditional_conditioning, image_conditioning=self.txt2img_image_conditioning(x, self.firstphase_width, self.firstphase_height), mimic_scale=self.mimic_scale, threshold_enable=self.threshold_enable)
 
         samples = samples[:, :, self.truncate_y//2:samples.shape[2]-self.truncate_y//2, self.truncate_x//2:samples.shape[3]-self.truncate_x//2]
 
@@ -718,7 +730,13 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             for i in range(samples.shape[0]):
                 save_intermediate(samples, i)
 
-            samples = torch.nn.functional.interpolate(samples, size=(self.height // opt_f, self.width // opt_f), mode="bilinear")
+            # LATENT UPSCALE MOD https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/4446
+            # Note that it's enabled in settings
+            # samples = torch.nn.functional.interpolate(samples, size=(self.height // opt_f, self.width // opt_f), mode="bilinear")
+            print("!!!!!!!!!!!!!!!!!! UPSCALING LATENT !!!!!!!!!!!!!!!!!!!!!")
+            print(prompts)
+            samples=run_sdu_latent_upscale(samples,prompts[0], size=(self.height // opt_f, self.width // opt_f) )
+            print("!!!!!!!!!!!!!!!!!! UPSCALING DONE !!!!!!!!!!!!!!!!!!!!!")
 
             # Avoid making the inpainting conditioning unless necessary as 
             # this does need some extra compute to decode / encode the image again.
@@ -902,7 +920,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
             self.extra_generation_params["Noise multiplier"] = self.initial_noise_multiplier
             x *= self.initial_noise_multiplier
 
-        samples = self.sampler.sample_img2img(self, self.init_latent, x, conditioning, unconditional_conditioning, image_conditioning=self.image_conditioning)
+        samples = self.sampler.sample_img2img(self, self.init_latent, x, conditioning, unconditional_conditioning, image_conditioning=self.image_conditioning, mimic_scale=self.mimic_scale, threshold_enable=self.threshold_enable)
 
         if self.mask is not None:
             samples = samples * self.nmask + self.init_latent * self.mask
