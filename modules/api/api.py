@@ -138,8 +138,10 @@ class Api:
 
 
         b64images = list(map(encode_pil_to_base64, processed.images))
+        thumbnails = self.scale_images_for_thumbnails(processed.images)
+        b64thumbnails = list(map(encode_pil_to_base64, thumbnails))
 
-        return TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+        return TextToImageResponse(images=b64images, thumbnails=b64thumbnails, parameters=vars(txt2imgreq), info=processed.js())
 
     def img2imgapi(self, img2imgreq: StableDiffusionImg2ImgProcessingAPI):
         init_images = img2imgreq.init_images
@@ -172,12 +174,14 @@ class Api:
             shared.state.end()
 
         b64images = list(map(encode_pil_to_base64, processed.images))
+        thumbnails = self.scale_images_for_thumbnails(processed.images)
+        b64thumbnails = list(map(encode_pil_to_base64, thumbnails))
 
         if not img2imgreq.include_init_images:
             img2imgreq.init_images = None
             img2imgreq.mask = None
 
-        return ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+        return ImageToImageResponse(images=b64images, thumbnails=b64thumbnails, parameters=vars(img2imgreq), info=processed.js())
 
     def extras_single_image_api(self, req: ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
