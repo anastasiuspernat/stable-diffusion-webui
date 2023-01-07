@@ -349,6 +349,10 @@ def reload_model_weights(sd_model=None, info=None):
     current_checkpoint_info = sd_model.sd_checkpoint_info
     checkpoint_config = find_checkpoint_config(current_checkpoint_info)
 
+    if sd_model.sd_checkpoint_info.hash == checkpoint_info.hash:
+        print("Hashes are the same, won't reload checkpoint.")
+        return
+
     if sd_model.sd_model_checkpoint == checkpoint_info.filename:
         return
 
