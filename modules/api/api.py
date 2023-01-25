@@ -143,6 +143,27 @@ class Api:
 
         raise HTTPException(status_code=401, detail="Incorrect username or password", headers={"WWW-Authenticate": "Basic"})
 
+    # Thumbnals: Anastasiy
+    def scale_images_for_thumbnails(self, images):
+        scaled_images = []
+        for image in images:
+            # Make a copy of the image
+            image_copy = image.copy()
+            width, height = image_copy.size
+            if width > 512 or height > 512:
+                # Calculate the new width and height to maintain the aspect ratio
+                if width > height:
+                    new_width = 512
+                    new_height = int(512 * height / width)
+                else:
+                    new_width = int(512 * width / height)
+                    new_height = 512
+                # Resize the image
+                image_copy = image_copy.resize((new_width, new_height), Image.LANCZOS)
+            # Add the resized image to the list
+            scaled_images.append(image_copy)
+        return scaled_images
+
     def text2imgapi(self, txt2imgreq: StableDiffusionTxt2ImgProcessingAPI):
         populate = txt2imgreq.copy(update={ # Override __init__ params
             "sampler_name": validate_sampler_name(txt2imgreq.sampler_name or txt2imgreq.sampler_index),
@@ -162,8 +183,10 @@ class Api:
 
 
         b64images = list(map(encode_pil_to_base64, processed.images))
+        thumbnails = self.scale_images_for_thumbnails(processed.images)
+        b64thumbnails = list(map(encode_pil_to_base64, thumbnails))
 
-        return TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+        return TextToImageResponse(images=b64images, thumbnails=b64thumbnails, parameters=vars(txt2imgreq), info=processed.js())
 
     def img2imgapi(self, img2imgreq: StableDiffusionImg2ImgProcessingAPI):
         init_images = img2imgreq.init_images
@@ -196,12 +219,14 @@ class Api:
             shared.state.end()
 
         b64images = list(map(encode_pil_to_base64, processed.images))
+        thumbnails = self.scale_images_for_thumbnails(processed.images)
+        b64thumbnails = list(map(encode_pil_to_base64, thumbnails))
 
         if not img2imgreq.include_init_images:
             img2imgreq.init_images = None
             img2imgreq.mask = None
 
-        return ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+        return ImageToImageResponse(images=b64images, thumbnails=b64thumbnails, parameters=vars(img2imgreq), info=processed.js())
 
     def extras_single_image_api(self, req: ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
