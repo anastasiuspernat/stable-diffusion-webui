@@ -3,7 +3,6 @@ import json
 import numpy as np
 import zlib
 from PIL import Image, PngImagePlugin, ImageDraw, ImageFont
-from fonts.ttf import Roboto
 import torch
 from modules.shared import opts
 
@@ -17,7 +16,7 @@ class EmbeddingEncoder(json.JSONEncoder):
 
 class EmbeddingDecoder(json.JSONDecoder):
     def __init__(self, *args, **kwargs):
-        json.JSONDecoder.__init__(self, object_hook=self.object_hook, *args, **kwargs)
+        json.JSONDecoder.__init__(self, *args, object_hook=self.object_hook, **kwargs)
 
     def object_hook(self, d):
         if 'TORCHTENSOR' in d:
@@ -43,7 +42,7 @@ def lcg(m=2**32, a=1664525, c=1013904223, seed=0):
 
 def xor_block(block):
     g = lcg()
-    randblock = np.array([next(g) for _ in range(np.product(block.shape))]).astype(np.uint8).reshape(block.shape)
+    randblock = np.array([next(g) for _ in range(np.prod(block.shape))]).astype(np.uint8).reshape(block.shape)
     return np.bitwise_xor(block.astype(np.uint8), randblock & 0x0F)
 
 
@@ -114,7 +113,6 @@ def extract_image_data_embed(image):
     outarr = crop_black(np.array(image.convert('RGB').getdata()).reshape(image.size[1], image.size[0], d).astype(np.uint8)) & 0x0F
     black_cols = np.where(np.sum(outarr, axis=(0, 2)) == 0)
     if black_cols[0].shape[0] < 2:
-        print('No Image data blocks found.')
         return None
 
     data_block_lower = outarr[:, :black_cols[0].min(), :].astype(np.uint8)
@@ -132,15 +130,10 @@ def extract_image_data_embed(image):
 
 def caption_image_overlay(srcimage, title, footerLeft, footerMid, footerRight, textfont=None):
     from math import cos
-
     image = srcimage.copy()
     fontsize = 32
     if textfont is None:
-        try:
-            textfont = ImageFont.truetype(opts.font or Roboto, fontsize)
-            textfont = opts.font or Roboto
-        except Exception:
-            textfont = Roboto
+        textfont = opts.font or 'html/roboto.ttf'
 
     factor = 1.5
     gradient = Image.new('RGBA', (1, image.size[1]), color=(0, 0, 0, 0))

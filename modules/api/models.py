@@ -1,11 +1,9 @@
 import inspect
-from pydantic import BaseModel, Field, create_model
-from typing import Any, Optional
-from typing_extensions import Literal
+from typing import Any, Optional, Dict, List
+from pydantic import BaseModel, Field, create_model # pylint: disable=no-name-in-module
 from inflection import underscore
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img
-from modules.shared import sd_upscalers, opts, parser
-from typing import Dict, List
+import modules.shared as shared
 
 API_NOT_ALLOWED = [
     "self",
@@ -14,8 +12,6 @@ API_NOT_ALLOWED = [
     "outpath_samples",
     "outpath_grids",
     "sampler_index",
-    "do_not_save_samples",
-    "do_not_save_grid",
     "extra_generation_params",
     "overlay_images",
     "do_not_reload_embeddings",
@@ -48,7 +44,7 @@ class PydanticModelGenerator:
         class_instance = None,
         additional_fields = None,
     ):
-        def field_type_generator(k, v):
+        def field_type_generator(_k, v):
             # field_type = str if not overrides.get(k) else overrides[k]["type"]
             # print(k, v.annotation, v.default)
             field_type = v.annotation
@@ -76,23 +72,21 @@ class PydanticModelGenerator:
             for (k,v) in self._class_data.items() if k not in API_NOT_ALLOWED
         ]
 
-        for fields in additional_fields:
+        for fld in additional_fields:
             self._model_def.append(ModelDef(
-                field=underscore(fields["key"]),
-                field_alias=fields["key"],
-                field_type=fields["type"],
-                field_value=fields["default"],
-                field_exclude=fields["exclude"] if "exclude" in fields else False))
+                field=underscore(fld["key"]),
+                field_alias=fld["key"],
+                field_type=fld["type"],
+                field_value=fld["default"],
+                field_exclude=fld["exclude"] if "exclude" in fld else False))
 
     def generate_model(self):
         """
         Creates a pydantic BaseModel
         from the json and overrides provided at initialization
         """
-        fields = {
-            d.field: (d.field_type, Field(default=d.field_value, alias=d.field_alias, exclude=d.field_exclude)) for d in self._model_def
-        }
-        DynamicModel = create_model(self._model_name, **fields)
+        model_fields = { d.field: (d.field_type, Field(default=d.field_value, alias=d.field_alias, exclude=d.field_exclude)) for d in self._model_def }
+        DynamicModel = create_model(self._model_name, **model_fields)
         DynamicModel.__config__.allow_population_by_field_name = True
         DynamicModel.__config__.allow_mutation = True
         return DynamicModel
@@ -100,13 +94,31 @@ class PydanticModelGenerator:
 StableDiffusionTxt2ImgProcessingAPI = PydanticModelGenerator(
     "StableDiffusionProcessingTxt2Img",
     StableDiffusionProcessingTxt2Img,
-    [{"key": "sampler_index", "type": str, "default": "Euler"}, {"key": "script_name", "type": str, "default": None}, {"key": "script_args", "type": list, "default": []}]
+    [
+        {"key": "sampler_index", "type": str, "default": "Euler"},
+        {"key": "script_name", "type": str, "default": None},
+        {"key": "script_args", "type": list, "default": []},
+        {"key": "send_images", "type": bool, "default": True},
+        {"key": "save_images", "type": bool, "default": False},
+        {"key": "alwayson_scripts", "type": dict, "default": {}},
+    ]
 ).generate_model()
 
 StableDiffusionImg2ImgProcessingAPI = PydanticModelGenerator(
     "StableDiffusionProcessingImg2Img",
     StableDiffusionProcessingImg2Img,
-    [{"key": "sampler_index", "type": str, "default": "Euler"}, {"key": "init_images", "type": list, "default": None}, {"key": "denoising_strength", "type": float, "default": 0.75}, {"key": "mask", "type": str, "default": None}, {"key": "include_init_images", "type": bool, "default": False, "exclude" : True}, {"key": "script_name", "type": str, "default": None}, {"key": "script_args", "type": list, "default": []}]
+    [
+        {"key": "sampler_index", "type": str, "default": "Euler"},
+        {"key": "init_images", "type": list, "default": None},
+        {"key": "denoising_strength", "type": float, "default": 0.75},
+        {"key": "mask", "type": str, "default": None},
+        {"key": "include_init_images", "type": bool, "default": False, "exclude" : True},
+        {"key": "script_name", "type": str, "default": None},
+        {"key": "script_args", "type": list, "default": []},
+        {"key": "send_images", "type": bool, "default": True},
+        {"key": "save_images", "type": bool, "default": False},
+        {"key": "alwayson_scripts", "type": dict, "default": {}},
+    ]
 ).generate_model()
 
 class TextToImageResponse(BaseModel):
@@ -120,7 +132,7 @@ class ImageToImageResponse(BaseModel):
     info: str
 
 class ExtrasBaseRequest(BaseModel):
-    resize_mode: Literal[0, 1] = Field(default=0, title="Resize Mode", description="Sets the resize mode: 0 to upscale by upscaling_resize amount, 1 to upscale up to upscaling_resize_h x upscaling_resize_w.")
+    resize_mode: float = Field(default=0, title="Resize Mode", description="Sets the resize mode: 0 to upscale by upscaling_resize amount, 1 to upscale up to upscaling_resize_h x upscaling_resize_w.")
     show_extras_results: bool = Field(default=True, title="Show results", description="Should the backend return the generated image?")
     gfpgan_visibility: float = Field(default=0, title="GFPGAN Visibility", ge=0, le=1, allow_inf_nan=False, description="Sets the visibility of GFPGAN, values should be between 0 and 1.")
     codeformer_visibility: float = Field(default=0, title="CodeFormer Visibility", ge=0, le=1, allow_inf_nan=False, description="Sets the visibility of CodeFormer, values should be between 0 and 1.")
@@ -129,8 +141,8 @@ class ExtrasBaseRequest(BaseModel):
     upscaling_resize_w: int = Field(default=512, title="Target Width", ge=1, description="Target width for the upscaler to hit. Only used when resize_mode=1.")
     upscaling_resize_h: int = Field(default=512, title="Target Height", ge=1, description="Target height for the upscaler to hit. Only used when resize_mode=1.")
     upscaling_crop: bool = Field(default=True, title="Crop to fit", description="Should the upscaler crop the image to fit in the chosen size?")
-    upscaler_1: str = Field(default="None", title="Main upscaler", description=f"The name of the main upscaler to use, it has to be one of this list: {' , '.join([x.name for x in sd_upscalers])}")
-    upscaler_2: str = Field(default="None", title="Secondary upscaler", description=f"The name of the secondary upscaler to use, it has to be one of this list: {' , '.join([x.name for x in sd_upscalers])}")
+    upscaler_1: str = Field(default="None", title="Main upscaler", description=f"The name of the main upscaler to use, it has to be one of this list: {' , '.join([x.name for x in shared.sd_upscalers])}")
+    upscaler_2: str = Field(default="None", title="Secondary upscaler", description=f"The name of the secondary upscaler to use, it has to be one of this list: {' , '.join([x.name for x in shared.sd_upscalers])}")
     extras_upscaler_2_visibility: float = Field(default=0, title="Secondary upscaler visibility", ge=0, le=1, allow_inf_nan=False, description="Sets the visibility of secondary upscaler, values should be between 0 and 1.")
     upscale_first: bool = Field(default=False, title="Upscale first", description="Should the upscaler run before restoring faces?")
 
@@ -160,6 +172,10 @@ class PNGInfoResponse(BaseModel):
     info: str = Field(title="Image info", description="A string with the parameters used to generate the image")
     items: dict = Field(title="Items", description="An object containing all the info the image had")
 
+class LogRequest(BaseModel):
+    lines: int = Field(default=100, title="Lines", description="How many lines to return")
+    clear: bool = Field(default=False, title="Clear", description="Should the log be cleared after returning the lines?")
+
 class ProgressRequest(BaseModel):
     skip_current_image: bool = Field(default=False, title="Skip current image", description="Skip current image serialization")
 
@@ -187,11 +203,11 @@ class PreprocessResponse(BaseModel):
     info: str = Field(title="Preprocess info", description="Response string from preprocessing task.")
 
 fields = {}
-for key, metadata in opts.data_labels.items():
-    value = opts.data.get(key)
-    optType = opts.typemap.get(type(metadata.default), type(value))
+for key, metadata in shared.opts.data_labels.items():
+    value = shared.opts.data.get(key) or shared.opts.data_labels[key].default
+    optType = shared.opts.typemap.get(type(metadata.default), type(value))
 
-    if (metadata is not None):
+    if metadata is not None:
         fields.update({key: (Optional[optType], Field(
             default=metadata.default ,description=metadata.label))})
     else:
@@ -200,13 +216,14 @@ for key, metadata in opts.data_labels.items():
 OptionsModel = create_model("Options", **fields)
 
 flags = {}
-_options = vars(parser)['_option_string_actions']
+_options = vars(shared.parser)['_option_string_actions']
 for key in _options:
-    if(_options[key].dest != 'help'):
+    if _options[key].dest != 'help':
         flag = _options[key]
         _type = str
-        if _options[key].default is not None: _type = type(_options[key].default)
-        flags.update({flag.dest: (_type,Field(default=flag.default, description=flag.help))})
+        if _options[key].default is not None:
+            _type = type(_options[key].default)
+        flags.update({flag.dest: (_type, Field(default=flag.default, description=flag.help))})
 
 FlagsModel = create_model("Flags", **flags)
 
@@ -214,6 +231,10 @@ class SamplerItem(BaseModel):
     name: str = Field(title="Name")
     aliases: List[str] = Field(title="Aliases")
     options: Dict[str, str] = Field(title="Options")
+
+class SDVaeItem(BaseModel):
+    model_name: str = Field(title="Model Name")
+    filename: str = Field(title="Filename")
 
 class UpscalerItem(BaseModel):
     name: str = Field(title="Name")
@@ -224,10 +245,11 @@ class UpscalerItem(BaseModel):
 
 class SDModelItem(BaseModel):
     title: str = Field(title="Title")
-    model_name: str = Field(title="Model Name")
-    hash: Optional[str] = Field(title="Short hash")
-    sha256: Optional[str] = Field(title="sha256 hash")
+    name: str = Field(title="Model Name")
     filename: str = Field(title="Filename")
+    type: str = Field(title="Model type")
+    sha256: Optional[str] = Field(title="SHA256 hash")
+    hash: Optional[str] = Field(title="Short hash")
     config: Optional[str] = Field(title="Config file")
 
 class HypernetworkItem(BaseModel):
@@ -243,10 +265,27 @@ class RealesrganItem(BaseModel):
     path: Optional[str] = Field(title="Path")
     scale: Optional[int] = Field(title="Scale")
 
-class PromptStyleItem(BaseModel):
+class StyleItem(BaseModel):
     name: str = Field(title="Name")
     prompt: Optional[str] = Field(title="Prompt")
     negative_prompt: Optional[str] = Field(title="Negative Prompt")
+    extra: Optional[str] = Field(title="Extra")
+    filename: Optional[str] = Field(title="Filename")
+    preview: Optional[str] = Field(title="Preview")
+
+class ExtraNetworkItem(BaseModel):
+    name: str = Field(title="Name")
+    type: str = Field(title="Type")
+    title: Optional[str] = Field(title="Title")
+    fullname: Optional[str] = Field(title="Fullname")
+    filename: Optional[str] = Field(title="Filename")
+    hash: Optional[str] = Field(title="Hash")
+    preview: Optional[str] = Field(title="Preview image URL")
+    # description: Optional[str] = Field(title="Description")
+    # info: Optional[str] = Field(title="Information")
+    # metadata: Optional[Any] = Field(title="Metadata")
+    # local: Optional[str] = Field(title="Local")
+
 
 class ArtistItem(BaseModel):
     name: str = Field(title="Name")
@@ -267,3 +306,23 @@ class EmbeddingsResponse(BaseModel):
 class MemoryResponse(BaseModel):
     ram: dict = Field(title="RAM", description="System memory stats")
     cuda: dict = Field(title="CUDA", description="nVidia CUDA memory stats")
+
+class ScriptsList(BaseModel):
+    txt2img: list = Field(default=None, title="Txt2img", description="Titles of scripts (txt2img)")
+    img2img: list = Field(default=None, title="Img2img", description="Titles of scripts (img2img)")
+
+
+class ScriptArg(BaseModel):
+    label: str = Field(default=None, title="Label", description="Name of the argument in UI")
+    value: Optional[Any] = Field(default=None, title="Value", description="Default value of the argument")
+    minimum: Optional[Any] = Field(default=None, title="Minimum", description="Minimum allowed value for the argumentin UI")
+    maximum: Optional[Any] = Field(default=None, title="Minimum", description="Maximum allowed value for the argumentin UI")
+    step: Optional[Any] = Field(default=None, title="Minimum", description="Step for changing value of the argumentin UI")
+    choices: Optional[Any] = Field(default=None, title="Choices", description="Possible values for the argument")
+
+
+class ScriptInfo(BaseModel):
+    name: str = Field(default=None, title="Name", description="Script name")
+    is_alwayson: bool = Field(default=None, title="IsAlwayson", description="Flag specifying whether this script is an alwayson script")
+    is_img2img: bool = Field(default=None, title="IsImg2img", description="Flag specifying whether this script is an img2img script")
+    args: List[ScriptArg] = Field(title="Arguments", description="List of script's arguments")

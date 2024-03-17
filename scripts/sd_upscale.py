@@ -1,12 +1,10 @@
 import math
-
-import modules.scripts as scripts
 import gradio as gr
 from PIL import Image
-
-from modules import processing, shared, sd_samplers, images, devices
+import modules.scripts as scripts
+from modules import processing, shared, images, devices
 from modules.processing import Processed
-from modules.shared import opts, cmd_opts, state
+from modules.shared import opts, state, log
 
 
 class Script(scripts.Script):
@@ -16,7 +14,7 @@ class Script(scripts.Script):
     def show(self, is_img2img):
         return is_img2img
 
-    def ui(self, is_img2img):        
+    def ui(self, is_img2img):
         info = gr.HTML("<p style=\"margin-bottom:0.75em\">Will upscale the image by the selected scale factor; use width and height sliders to set tile size</p>")
         overlap = gr.Slider(minimum=0, maximum=256, step=16, label='Tile overlap', value=64, elem_id=self.elem_id("overlap"))
         scale_factor = gr.Slider(minimum=1.0, maximum=4.0, step=0.05, label='Scale Factor', value=2.0, elem_id=self.elem_id("scale_factor"))
@@ -56,14 +54,14 @@ class Script(scripts.Script):
 
         work = []
 
-        for y, h, row in grid.tiles:
+        for _y, _h, row in grid.tiles:
             for tiledata in row:
                 work.append(tiledata[2])
 
         batch_count = math.ceil(len(work) / batch_size)
         state.job_count = batch_count * upscale_count
 
-        print(f"SD upscaling will process a total of {len(work)} images tiled as {len(grid.tiles[0][2])}x{len(grid.tiles)} per upscale in a total of {state.job_count} batches.")
+        log.info(f"SD upscale: images={len(work)} tile={len(grid.tiles[0][2])}x{len(grid.tiles)} batches={state.job_count}")
 
         result_images = []
         for n in range(upscale_count):
@@ -85,7 +83,7 @@ class Script(scripts.Script):
                 work_results += processed.images
 
             image_index = 0
-            for y, h, row in grid.tiles:
+            for _y, _h, row in grid.tiles:
                 for tiledata in row:
                     tiledata[2] = work_results[image_index] if image_index < len(work_results) else Image.new("RGB", (p.width, p.height))
                     image_index += 1

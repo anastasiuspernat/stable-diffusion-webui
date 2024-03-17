@@ -1,34 +1,29 @@
-import re
 import os
 
 import torch
 
-from modules import shared, paths, sd_disable_initialization
+from modules import paths, sd_disable_initialization, devices
 
-sd_configs_path = shared.sd_configs_path
 sd_repo_configs_path = os.path.join(paths.paths['Stable Diffusion'], "configs", "stable-diffusion")
-
-
-config_default = shared.sd_default_config
+config_default = paths.sd_default_config
 config_sd2 = os.path.join(sd_repo_configs_path, "v2-inference.yaml")
 config_sd2v = os.path.join(sd_repo_configs_path, "v2-inference-v.yaml")
 config_sd2_inpainting = os.path.join(sd_repo_configs_path, "v2-inpainting-inference.yaml")
 config_depth_model = os.path.join(sd_repo_configs_path, "v2-midas-inference.yaml")
-config_inpainting = os.path.join(sd_configs_path, "v1-inpainting-inference.yaml")
-config_instruct_pix2pix = os.path.join(sd_configs_path, "instruct-pix2pix.yaml")
-config_alt_diffusion = os.path.join(sd_configs_path, "alt-diffusion-inference.yaml")
+config_unclip = os.path.join(sd_repo_configs_path, "v2-1-stable-unclip-l-inference.yaml")
+config_unopenclip = os.path.join(sd_repo_configs_path, "v2-1-stable-unclip-h-inference.yaml")
+config_inpainting = os.path.join(paths.sd_configs_path, "v1-inpainting-inference.yaml")
+config_instruct_pix2pix = os.path.join(paths.sd_configs_path, "instruct-pix2pix.yaml")
+config_alt_diffusion = os.path.join(paths.sd_configs_path, "alt-diffusion-inference.yaml")
 
 
 def is_using_v_parameterization_for_sd2(state_dict):
     """
     Detects whether unet in state_dict is using v-parameterization. Returns True if it is. You're welcome.
     """
-
     import ldm.modules.diffusionmodules.openaimodel
-    from modules import devices
 
     device = devices.cpu
-
     with sd_disable_initialization.DisableInitialization():
         unet = ldm.modules.diffusionmodules.openaimodel.UNetModel(
             use_checkpoint=True,
@@ -49,7 +44,7 @@ def is_using_v_parameterization_for_sd2(state_dict):
         )
         unet.eval()
 
-    with torch.no_grad():
+    with devices.inference_context():
         unet_sd = {k.replace("model.diffusion_model.", ""): v for k, v in state_dict.items() if "model.diffusion_model." in k}
         unet.load_state_dict(unet_sd, strict=True)
         unet.to(device=device, dtype=torch.float)
@@ -62,12 +57,19 @@ def is_using_v_parameterization_for_sd2(state_dict):
     return out < -1
 
 
-def guess_model_config_from_state_dict(sd, filename):
+def guess_model_config_from_state_dict(sd, _filename):
+    if sd is None:
+        return None
     sd2_cond_proj_weight = sd.get('cond_stage_model.model.transformer.resblocks.0.attn.in_proj_weight', None)
     diffusion_model_input = sd.get('model.diffusion_model.input_blocks.0.0.weight', None)
+    sd2_variations_weight = sd.get('embedder.model.ln_final.weight', None)
 
     if sd.get('depth_model.model.pretrained.act_postprocess3.0.project.0.bias', None) is not None:
         return config_depth_model
+    elif sd2_variations_weight is not None and sd2_variations_weight.shape[0] == 768:
+        return config_unclip
+    elif sd2_variations_weight is not None and sd2_variations_weight.shape[0] == 1024:
+        return config_unopenclip
 
     if sd2_cond_proj_weight is not None and sd2_cond_proj_weight.shape[1] == 1024:
         if diffusion_model_input.shape[1] == 9:
@@ -104,9 +106,8 @@ def find_checkpoint_config_near_filename(info):
     if info is None:
         return None
 
-    config = os.path.splitext(info.filename)[0] + ".yaml"
+    config = f"{os.path.splitext(info.filename)[0]}.yaml"
     if os.path.exists(config):
         return config
 
     return None
-

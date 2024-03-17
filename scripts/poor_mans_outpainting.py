@@ -1,17 +1,15 @@
 import math
-
-import modules.scripts as scripts
 import gradio as gr
 from PIL import Image, ImageDraw
-
-from modules import images, processing, devices
+import modules.scripts as scripts
+from modules import images, devices
 from modules.processing import Processed, process_images
-from modules.shared import opts, cmd_opts, state
+from modules.shared import opts, state, log
 
 
 class Script(scripts.Script):
     def title(self):
-        return "Poor man's outpainting"
+        return "Outpainting alternative"
 
     def show(self, is_img2img):
         return is_img2img
@@ -19,7 +17,7 @@ class Script(scripts.Script):
     def ui(self, is_img2img):
         if not is_img2img:
             return None
-        
+
         pixels = gr.Slider(label="Pixels to expand", minimum=8, maximum=256, step=8, value=128, elem_id=self.elem_id("pixels"))
         mask_blur = gr.Slider(label='Mask blur', minimum=0, maximum=64, step=1, value=4, elem_id=self.elem_id("mask_blur"))
         inpainting_fill = gr.Radio(label='Masked content', choices=['fill', 'original', 'latent noise', 'latent nothing'], value='fill', type="index", elem_id=self.elem_id("inpainting_fill"))
@@ -104,7 +102,7 @@ class Script(scripts.Script):
                 work_latent_mask.append(tiledata_latent_mask[2])
 
         batch_count = len(work)
-        print(f"Poor man's outpainting will process a total of {len(work)} images tiled as {len(grid.tiles[0][2])}x{len(grid.tiles)}.")
+        log.info(f"Poor-man-outpainting: images={len(work)} tiles={len(grid.tiles[0][2])}x{len(grid.tiles)}.")
 
         state.job_count = batch_count
 
@@ -138,9 +136,8 @@ class Script(scripts.Script):
         combined_image = images.combine_grid(grid)
 
         if opts.samples_save:
-            images.save_image(combined_image, p.outpath_samples, "", initial_seed, p.prompt, opts.grid_format, info=initial_info, p=p)
+            images.save_image(combined_image, p.outpath_samples, "", initial_seed, p.prompt, opts.samples_format, info=initial_info, p=p)
 
         processed = Processed(p, [combined_image], initial_seed, initial_info)
 
         return processed
-

@@ -1,18 +1,16 @@
-import os
+import io
+import contextlib
 import torch
+stdout = io.StringIO()
+with contextlib.redirect_stdout(stdout):
+    import ldm.models.diffusion.ddpm
+    import ldm.models.diffusion.ddim
+    import ldm.models.diffusion.plms
 
-from einops import repeat
-from omegaconf import ListConfig
-
-import ldm.models.diffusion.ddpm
-import ldm.models.diffusion.ddim
-import ldm.models.diffusion.plms
-
-from ldm.models.diffusion.ddpm import LatentDiffusion
-from ldm.models.diffusion.plms import PLMSSampler
-from ldm.models.diffusion.ddim import DDIMSampler, noise_like
+from ldm.models.diffusion.ddpm import LatentDiffusion # pylint: disable=unused-import
+from ldm.models.diffusion.plms import PLMSSampler # pylint: disable=unused-import
+from ldm.models.diffusion.ddim import DDIMSampler, noise_like # pylint: disable=unused-import
 from ldm.models.diffusion.sampling_util import norm_thresholding
-
 
 @torch.no_grad()
 def p_sample_plms(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
@@ -29,7 +27,7 @@ def p_sample_plms(self, x, c, t, index, repeat_noise=False, use_original_steps=F
 
             if isinstance(c, dict):
                 assert isinstance(unconditional_conditioning, dict)
-                c_in = dict()
+                c_in = {}
                 for k in c:
                     if isinstance(c[k], list):
                         c_in[k] = [

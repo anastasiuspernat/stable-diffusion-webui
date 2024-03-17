@@ -11,20 +11,20 @@
 #   https://arxiv.org/abs/2112.05682v2
 
 from functools import partial
+import math
+from typing import Optional, NamedTuple, List
 import torch
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
-import math
-from typing import Optional, NamedTuple, List
 
 
 def narrow_trunc(
-    input: Tensor,
+    tensor: Tensor,
     dim: int,
     start: int,
     length: int
 ) -> Tensor:
-    return torch.narrow(input, dim, start, length if input.shape[dim] >= start + length else input.shape[dim] - start)
+    return torch.narrow(tensor, dim, start, length if tensor.shape[dim] >= start + length else tensor.shape[dim] - start)
 
 
 class AttnChunk(NamedTuple):
@@ -79,8 +79,8 @@ def _query_chunk_attention(
     summarize_chunk: SummarizeChunk,
     kv_chunk_size: int,
 ) -> Tensor:
-    batch_x_heads, k_tokens, k_channels_per_head = key.shape
-    _, _, v_channels_per_head = value.shape
+    _batch_x_heads, k_tokens, _k_channels_per_head = key.shape
+    # _, _, v_channels_per_head = value.shape
 
     def chunk_scanner(chunk_idx: int) -> AttnChunk:
         key_chunk = narrow_trunc(
@@ -113,7 +113,6 @@ def _query_chunk_attention(
     return all_values / all_weights
 
 
-# TODO: refactor CrossAttention#get_attention_scores to share code with this
 def _get_attention_scores_no_kv_chunking(
     query: Tensor,
     key: Tensor,
@@ -164,7 +163,7 @@ def efficient_dot_product_attention(
       Returns:
         Output of shape `[batch * num_heads, query_tokens, channels_per_head]`.
       """
-    batch_x_heads, q_tokens, q_channels_per_head = query.shape
+    _batch_x_heads, q_tokens, q_channels_per_head = query.shape
     _, k_tokens, _ = key.shape
     scale = q_channels_per_head ** -0.5
 
@@ -179,7 +178,7 @@ def efficient_dot_product_attention(
             chunk_idx,
             min(query_chunk_size, q_tokens)
         )
-    
+
     summarize_chunk: SummarizeChunk = partial(_summarize_chunk, scale=scale)
     summarize_chunk: SummarizeChunk = partial(checkpoint, summarize_chunk) if use_checkpoint else summarize_chunk
     compute_query_chunk_attn: ComputeQueryChunkAttn = partial(
@@ -201,9 +200,7 @@ def efficient_dot_product_attention(
             key=key,
             value=value,
         )
-    
-    # TODO: maybe we should use torch.empty_like(query) to allocate storage in-advance,
-    # and pass slices to be mutated, instead of torch.cat()ing the returned slices
+
     res = torch.cat([
         compute_query_chunk_attn(
             query=get_query_chunk(i * query_chunk_size),

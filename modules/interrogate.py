@@ -1,18 +1,14 @@
 import os
 import sys
-import traceback
 from collections import namedtuple
 from pathlib import Path
 import re
-
 import torch
-import torch.hub
-
+import torch.hub # pylint: disable=ungrouped-imports
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
-
-import modules.shared as shared
 from modules import devices, paths, shared, lowvram, modelloader, errors
+
 
 blip_image_eval_size = 384
 clip_model_name = 'ViT-L/14'
@@ -26,14 +22,14 @@ def category_types():
 
 
 def download_default_clip_interrogate_categories(content_dir):
-    print("Downloading CLIP categories...")
+    shared.log.info("Downloading CLIP categories...")
 
-    tmpdir = content_dir + "_tmp"
-    category_types = ["artists", "flavors", "mediums", "movements"]
+    tmpdir = f"{content_dir}_tmp"
+    cat_types = ["artists", "flavors", "mediums", "movements"]
 
     try:
-        os.makedirs(tmpdir)
-        for category_type in category_types:
+        os.makedirs(tmpdir, exist_ok=True)
+        for category_type in cat_types:
             torch.hub.download_url_to_file(f"https://raw.githubusercontent.com/pharmapsychotic/clip-interrogator/main/clip_interrogator/data/{category_type}.txt", os.path.join(tmpdir, f"{category_type}.txt"))
         os.rename(tmpdir, content_dir)
 
@@ -41,7 +37,7 @@ def download_default_clip_interrogate_categories(content_dir):
         errors.display(e, "downloading default CLIP interrogate categories")
     finally:
         if os.path.exists(tmpdir):
-            os.remove(tmpdir)
+            os.removedirs(tmpdir)
 
 
 class InterrogateModels:
@@ -62,22 +58,21 @@ class InterrogateModels:
             download_default_clip_interrogate_categories(self.content_dir)
 
         if self.loaded_categories is not None and self.skip_categories == shared.opts.interrogate_clip_skip_categories:
-           return self.loaded_categories
+            return self.loaded_categories
 
         self.loaded_categories = []
 
         if os.path.exists(self.content_dir):
             self.skip_categories = shared.opts.interrogate_clip_skip_categories
-            category_types = []
+            cat_types = []
             for filename in Path(self.content_dir).glob('*.txt'):
-                category_types.append(filename.stem)
+                cat_types.append(filename.stem)
                 if filename.stem in self.skip_categories:
                     continue
                 m = re_topn.search(filename.stem)
                 topn = 1 if m is None else int(m.group(1))
                 with open(filename, "r", encoding="utf8") as file:
                     lines = [x.strip() for x in file.readlines()]
-
                 self.loaded_categories.append(Category(name=filename.stem, topn=topn, items=lines))
 
         return self.loaded_categories
@@ -91,7 +86,7 @@ class InterrogateModels:
 
     def load_blip_model(self):
         self.create_fake_fairscale()
-        import models.blip
+        import models.blip # pylint: disable=no-name-in-module
 
         files = modelloader.load_models(
             model_path=os.path.join(paths.models_path, "BLIP"),
@@ -100,7 +95,7 @@ class InterrogateModels:
             download_name='model_base_caption_capfilt_large.pth',
         )
 
-        blip_model = models.blip.blip_decoder(pretrained=files[0], image_size=blip_image_eval_size, vit='base', med_config=os.path.join(paths.paths["BLIP"], "configs", "med_config.json"))
+        blip_model = models.blip.blip_decoder(pretrained=files[0], image_size=blip_image_eval_size, vit='base', med_config=os.path.join(paths.paths["BLIP"], "configs", "med_config.json")) # pylint: disable=c-extension-no-member
         blip_model.eval()
 
         return blip_model
@@ -109,9 +104,9 @@ class InterrogateModels:
         import clip
 
         if self.running_on_cpu:
-            model, preprocess = clip.load(clip_model_name, device="cpu", download_root=shared.cmd_opts.clip_models_path)
+            model, preprocess = clip.load(clip_model_name, device="cpu", download_root=shared.opts.clip_models_path)
         else:
-            model, preprocess = clip.load(clip_model_name, download_root=shared.cmd_opts.clip_models_path)
+            model, preprocess = clip.load(clip_model_name, download_root=shared.opts.clip_models_path)
 
         model.eval()
         model = model.to(devices.device_interrogate)
@@ -121,14 +116,14 @@ class InterrogateModels:
     def load(self):
         if self.blip_model is None:
             self.blip_model = self.load_blip_model()
-            if not shared.cmd_opts.no_half and not self.running_on_cpu:
+            if not shared.opts.no_half and not self.running_on_cpu:
                 self.blip_model = self.blip_model.half()
 
         self.blip_model = self.blip_model.to(devices.device_interrogate)
 
         if self.clip_model is None:
             self.clip_model, self.clip_preprocess = self.load_clip_model()
-            if not shared.cmd_opts.no_half and not self.running_on_cpu:
+            if not shared.opts.no_half and not self.running_on_cpu:
                 self.clip_model = self.clip_model.half()
 
         self.clip_model = self.clip_model.to(devices.device_interrogate)
@@ -160,7 +155,7 @@ class InterrogateModels:
             text_array = text_array[0:int(shared.opts.interrogate_clip_dict_limit)]
 
         top_count = min(top_count, len(text_array))
-        text_tokens = clip.tokenize([text for text in text_array], truncate=True).to(devices.device_interrogate)
+        text_tokens = clip.tokenize(list(text_array), truncate=True).to(devices.device_interrogate)
         text_features = self.clip_model.encode_text(text_tokens).type(self.dtype)
         text_features /= text_features.norm(dim=-1, keepdim=True)
 
@@ -179,15 +174,14 @@ class InterrogateModels:
             transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
         ])(pil_image).unsqueeze(0).type(self.dtype).to(devices.device_interrogate)
 
-        with torch.no_grad():
+        with devices.inference_context():
             caption = self.blip_model.generate(gpu_image, sample=False, num_beams=shared.opts.interrogate_clip_num_beams, min_length=shared.opts.interrogate_clip_min_length, max_length=shared.opts.interrogate_clip_max_length)
 
         return caption[0]
 
     def interrogate(self, pil_image):
         res = ""
-        shared.state.begin()
-        shared.state.job = 'interrogate'
+        shared.state.begin('interrogate')
         try:
             if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
                 lowvram.send_everything_to_cpu()
@@ -203,22 +197,21 @@ class InterrogateModels:
 
             clip_image = self.clip_preprocess(pil_image).unsqueeze(0).type(self.dtype).to(devices.device_interrogate)
 
-            with torch.no_grad(), devices.autocast():
+            with devices.inference_context(), devices.autocast():
                 image_features = self.clip_model.encode_image(clip_image).type(self.dtype)
 
                 image_features /= image_features.norm(dim=-1, keepdim=True)
 
-                for name, topn, items in self.categories():
+                for _name, topn, items in self.categories():
                     matches = self.rank(image_features, items, top_count=topn)
                     for match, score in matches:
                         if shared.opts.interrogate_return_ranks:
                             res += f", ({match}:{score/100:.3f})"
                         else:
-                            res += ", " + match
+                            res += f", {match}"
 
-        except Exception:
-            print("Error interrogating", file=sys.stderr)
-            print(traceback.format_exc(), file=sys.stderr)
+        except Exception as e:
+            errors.display(e, 'interrogate')
             res += "<error>"
 
         self.unload()

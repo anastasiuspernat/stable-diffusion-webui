@@ -1,15 +1,12 @@
 import math
-
 import numpy as np
 import skimage
-
-import modules.scripts as scripts
 import gradio as gr
 from PIL import Image, ImageDraw
-
-from modules import images, processing, devices
+import modules.scripts as scripts
+from modules import images
 from modules.processing import Processed, process_images
-from modules.shared import opts, cmd_opts, state
+from modules.shared import opts, state
 
 
 # this function is taken from https://github.com/parlance-zz/g-diffuser-bot
@@ -72,8 +69,8 @@ def get_matched_noise(_np_src_image, np_mask_rgb, noise_q=1, color_variation=0.0
     height = _np_src_image.shape[1]
     num_channels = _np_src_image.shape[2]
 
-    np_src_image = _np_src_image[:] * (1. - np_mask_rgb)
-    np_mask_grey = (np.sum(np_mask_rgb, axis=2) / 3.)
+    _np_src_image[:] * (1. - np_mask_rgb) # pylint: disable=pointless-statement
+    np_mask_grey = np.sum(np_mask_rgb, axis=2) / 3.
     img_mask = np_mask_grey > 1e-6
     ref_mask = np_mask_grey < 1e-3
 
@@ -90,7 +87,7 @@ def get_matched_noise(_np_src_image, np_mask_rgb, noise_q=1, color_variation=0.0
 
     noise_window = _get_gaussian_window(width, height, mode=1)  # start with simple gaussian noise
     noise_rgb = rng.random((width, height, num_channels))
-    noise_grey = (np.sum(noise_rgb, axis=2) / 3.)
+    noise_grey = np.sum(noise_rgb, axis=2) / 3.
     noise_rgb *= color_variation  # the colorfulness of the starting noise is blended to greyscale with a parameter
     for c in range(num_channels):
         noise_rgb[:, :, c] += (1. - color_variation) * noise_grey
@@ -102,7 +99,7 @@ def get_matched_noise(_np_src_image, np_mask_rgb, noise_q=1, color_variation=0.0
     shaped_noise_fft = _fft2(noise_rgb)
     shaped_noise_fft[:, :, :] = np.absolute(shaped_noise_fft[:, :, :]) ** 2 * (src_dist ** noise_q) * src_phase  # perform the actual shaping
 
-    brightness_variation = 0.  # color_variation # todo: temporarily tieing brightness variation to color variation for now
+    brightness_variation = 0.  # color_variation
     contrast_adjusted_np_src = _np_src_image[:] * (brightness_variation + 1.) - brightness_variation * 2.
 
     # scikit-image is used for histogram matching, very convenient!
@@ -120,7 +117,7 @@ def get_matched_noise(_np_src_image, np_mask_rgb, noise_q=1, color_variation=0.0
 
 class Script(scripts.Script):
     def title(self):
-        return "Outpainting mk2"
+        return "Outpainting"
 
     def show(self, is_img2img):
         return is_img2img
@@ -139,7 +136,7 @@ class Script(scripts.Script):
 
         return [info, pixels, mask_blur, direction, noise_q, color_variation]
 
-    def run(self, p, _, pixels, mask_blur, direction, noise_q, color_variation):
+    def run(self, p, _, pixels, mask_blur, direction, noise_q, color_variation): # pylint: disable=arguments-differ
         initial_seed_and_info = [None, None]
 
         process_width = p.width
@@ -267,17 +264,16 @@ class Script(scripts.Script):
         all_images = all_processed_images
 
         combined_grid_image = images.image_grid(all_processed_images)
-        unwanted_grid_because_of_img_count = len(all_processed_images) < 2 and opts.grid_only_if_multiple
-        if opts.return_grid and not unwanted_grid_because_of_img_count:
+        if opts.return_grid and len(all_processed_images) > 1:
             all_images = [combined_grid_image] + all_processed_images
 
         res = Processed(p, all_images, initial_seed_and_info[0], initial_seed_and_info[1])
 
         if opts.samples_save:
             for img in all_processed_images:
-                images.save_image(img, p.outpath_samples, "", res.seed, p.prompt, opts.grid_format, info=res.info, p=p)
+                images.save_image(img, p.outpath_samples, "", res.seed, p.prompt, opts.samples_format, info=res.info, p=p)
 
-        if opts.grid_save and not unwanted_grid_because_of_img_count:
-            images.save_image(combined_grid_image, p.outpath_grids, "grid", res.seed, p.prompt, opts.grid_format, info=res.info, short_filename=not opts.grid_extended_filename, grid=True, p=p)
+        if opts.grid_save and len(all_processed_images) > 1:
+            images.save_image(combined_grid_image, p.outpath_grids, "grid", res.seed, p.prompt, opts.samples_format, info=res.info, grid=True, p=p)
 
         return res

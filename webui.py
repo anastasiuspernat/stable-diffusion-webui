@@ -1,36 +1,28 @@
+import io
 import os
 import sys
-import time
-import importlib
+import glob
 import signal
-import re
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from packaging import version
-
+import asyncio
 import logging
-logging.getLogger("xformers").addFilter(lambda record: 'A matching Triton is not available' not in record.getMessage())
+import importlib
+import contextlib
+from threading import Thread
+import modules.loader
+import torch # pylint: disable=wrong-import-order
+from modules import timer, errors, paths # pylint: disable=unused-import
+local_url = None
+from installer import log, git_commit
+import ldm.modules.encoders.modules # pylint: disable=W0611,C0411,E0401
+from modules import shared, extensions, extra_networks, ui_tempdir, ui_extra_networks, modelloader # pylint: disable=ungrouped-imports
+from modules.paths import create_paths
+from modules.call_queue import queue_lock, wrap_queued_call, wrap_gradio_gpu_call # pylint: disable=W0611,C0411,C0412
+import modules.devices
 
-from modules import import_hook, errors, extra_networks, ui_extra_networks_checkpoints
-from modules import extra_networks_hypernet, ui_extra_networks_hypernets, ui_extra_networks_textual_inversion
-from modules.call_queue import wrap_queued_call, queue_lock, wrap_gradio_gpu_call
-
-import torch
-
-# Truncate version number of nightly/local build of PyTorch to not cause exceptions with CodeFormer or Safetensors
-if ".dev" in torch.__version__ or "+git" in torch.__version__:
-    torch.__long_version__ = torch.__version__
-    torch.__version__ = re.search(r'[\d.]+[\d]', torch.__version__).group(0)
-
-from modules import shared, devices, sd_samplers, upscaler, extensions, localization, ui_tempdir, ui_extra_networks
-import modules.codeformer_model as codeformer
-import modules.face_restoration
-import modules.gfpgan_model as gfpgan
+import modules.sd_samplers
+import modules.upscaler
 import modules.img2img
-
 import modules.lowvram
-import modules.paths
 import modules.scripts
 import modules.sd_hijack
 import modules.sd_models
@@ -39,248 +31,324 @@ import modules.txt2img
 import modules.script_callbacks
 import modules.textual_inversion.textual_inversion
 import modules.progress
-
 import modules.ui
-from modules import modelloader
-from modules.shared import cmd_opts
+from modules.shared import cmd_opts, opts
 import modules.hypernetworks.hypernetwork
+from modules.middleware import setup_middleware
 
 
+try:
+    from installer import custom_excepthook # pylint: disable=ungrouped-imports
+    sys.excepthook = custom_excepthook
+except Exception:
+    pass
+
+state = shared.state
+if not modules.loader.initialized:
+    timer.startup.record("libraries")
+    log.setLevel(logging.DEBUG if cmd_opts.debug else logging.INFO)
+    logging.disable(logging.NOTSET if cmd_opts.debug else logging.DEBUG)
 if cmd_opts.server_name:
     server_name = cmd_opts.server_name
 else:
     server_name = "0.0.0.0" if cmd_opts.listen else None
 
+fastapi_args = {
+    "version": f'0.0.{git_commit}',
+    "title": "SD.Next",
+    "description": "SD.Next",
+    "docs_url": "/docs" if cmd_opts.docs else None,
+    "redocs_url": "/redocs" if cmd_opts.docs else None,
+    "swagger_ui_parameters": {
+        "displayOperationId": True,
+        "showCommonExtensions": True,
+        "deepLinking": False,
+    }
+}
+modules.loader.initialized = True
 
-def check_versions():
-    if shared.cmd_opts.skip_version_check:
-        return
 
-    expected_torch_version = "1.13.1"
-
-    if version.parse(torch.__version__) < version.parse(expected_torch_version):
-        errors.print_error_explanation(f"""
-You are running torch {torch.__version__}.
-The program is tested to work with torch {expected_torch_version}.
-To reinstall the desired version, run with commandline flag --reinstall-torch.
-Beware that this will cause a lot of large files to be downloaded, as well as
-there are reports of issues with training tab on the latest version.
-
-Use --skip-version-check commandline argument to disable this check.
-        """.strip())
-
-    expected_xformers_version = "0.0.16rc425"
-    if shared.xformers_available:
-        import xformers
-
-        if version.parse(xformers.__version__) < version.parse(expected_xformers_version):
-            errors.print_error_explanation(f"""
-You are running xformers {xformers.__version__}.
-The program is tested to work with xformers {expected_xformers_version}.
-To reinstall the desired version, run with commandline flag --reinstall-xformers.
-
-Use --skip-version-check commandline argument to disable this check.
-            """.strip())
+def check_rollback_vae():
+    if shared.cmd_opts.rollback_vae:
+        if not torch.cuda.is_available():
+            log.error("Rollback VAE functionality requires compatible GPU")
+            shared.cmd_opts.rollback_vae = False
+        elif not torch.__version__.startswith('2.1'):
+            log.error("Rollback VAE functionality requires Torch 2.1 or higher")
+            shared.cmd_opts.rollback_vae = False
+        elif 0 < torch.cuda.get_device_capability()[0] < 8:
+            log.error('Rollback VAE functionality device capabilities not met')
+            shared.cmd_opts.rollback_vae = False
 
 
 def initialize():
-    check_versions()
+    log.debug('Initializing')
+    check_rollback_vae()
+
+    modules.sd_samplers.list_samplers()
+    timer.startup.record("samplers")
+
+    modules.sd_vae.refresh_vae_list()
+    timer.startup.record("vae")
 
     extensions.list_extensions()
-    localization.list_localizations(cmd_opts.localizations_dir)
-
-    if cmd_opts.ui_debug_mode:
-        shared.sd_upscalers = upscaler.UpscalerLanczos().scalers
-        modules.scripts.load_scripts()
-        return
+    timer.startup.record("extensions")
 
     modelloader.cleanup_models()
     modules.sd_models.setup_model()
-    codeformer.setup_model(cmd_opts.codeformer_models_path)
-    gfpgan.setup_model(cmd_opts.gfpgan_models_path)
+    timer.startup.record("models")
 
-    modelloader.list_builtin_upscalers()
-    modules.scripts.load_scripts()
+    import modules.postprocess.codeformer_model as codeformer
+    codeformer.setup_model(opts.codeformer_models_path)
+    sys.modules["modules.codeformer_model"] = codeformer
+    import modules.postprocess.gfpgan_model as gfpgan
+    gfpgan.setup_model(opts.gfpgan_models_path)
+    timer.startup.record("face-restore")
+
+    log.debug('Loading extensions')
+    t_timer, t_total = modules.scripts.load_scripts()
+    timer.startup.record("extensions")
+    timer.startup.records["extensions"] = t_total # scripts can reset the time
+    log.info(f'Extensions time: {t_timer.summary()}')
+
     modelloader.load_upscalers()
+    timer.startup.record("upscalers")
 
-    modules.sd_vae.refresh_vae_list()
+    shared.opts.onchange("sd_vae", wrap_queued_call(lambda: modules.sd_vae.reload_vae_weights()), call=False)
+    shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed)
+    # shared.opts.onchange("gradio_theme", shared.reload_gradio_theme)
+    timer.startup.record("onchange")
 
     modules.textual_inversion.textual_inversion.list_textual_inversion_templates()
-
-    try:
-        modules.sd_models.load_model()
-    except Exception as e:
-        errors.display(e, "loading stable diffusion model")
-        print("", file=sys.stderr)
-        print("Stable diffusion model failed to load, exiting", file=sys.stderr)
-        exit(1)
-
-    shared.opts.data["sd_model_checkpoint"] = shared.sd_model.sd_checkpoint_info.title
-
-    shared.opts.onchange("sd_model_checkpoint", wrap_queued_call(lambda: modules.sd_models.reload_model_weights()))
-    shared.opts.onchange("sd_vae", wrap_queued_call(lambda: modules.sd_vae.reload_vae_weights()), call=False)
-    shared.opts.onchange("sd_vae_as_default", wrap_queued_call(lambda: modules.sd_vae.reload_vae_weights()), call=False)
-    shared.opts.onchange("temp_dir", ui_tempdir.on_tmpdir_changed)
-
     shared.reload_hypernetworks()
+    shared.prompt_styles.reload()
 
-    ui_extra_networks.intialize()
-    ui_extra_networks.register_page(ui_extra_networks_textual_inversion.ExtraNetworksPageTextualInversion())
-    ui_extra_networks.register_page(ui_extra_networks_hypernets.ExtraNetworksPageHypernetworks())
-    ui_extra_networks.register_page(ui_extra_networks_checkpoints.ExtraNetworksPageCheckpoints())
-
+    ui_extra_networks.initialize()
+    ui_extra_networks.register_pages()
     extra_networks.initialize()
-    extra_networks.register_extra_network(extra_networks_hypernet.ExtraNetworkHypernet())
+    extra_networks.register_default_extra_networks()
+    timer.startup.record("extra-networks")
 
-    if cmd_opts.tls_keyfile is not None and cmd_opts.tls_keyfile is not None:
-
+    if cmd_opts.tls_keyfile is not None and cmd_opts.tls_certfile is not None:
         try:
             if not os.path.exists(cmd_opts.tls_keyfile):
-                print("Invalid path to TLS keyfile given")
+                log.error("Invalid path to TLS keyfile given")
             if not os.path.exists(cmd_opts.tls_certfile):
-                print(f"Invalid path to TLS certfile: '{cmd_opts.tls_certfile}'")
+                log.error(f"Invalid path to TLS certfile: '{cmd_opts.tls_certfile}'")
         except TypeError:
             cmd_opts.tls_keyfile = cmd_opts.tls_certfile = None
-            print("TLS setup invalid, running webui without TLS")
+            log.error("TLS setup invalid, running webui without TLS")
         else:
-            print("Running with TLS")
+            log.info("Running with TLS")
+        timer.startup.record("tls")
 
     # make the program just exit at ctrl+c without waiting for anything
-    def sigint_handler(sig, frame):
-        print(f'Interrupted with signal {sig} in {frame}')
-        os._exit(0)
+    def sigint_handler(_sig, _frame):
+        log.info('Exiting')
+        try:
+            for f in glob.glob("*.lock"):
+                os.remove(f)
+        except Exception:
+            pass
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, sigint_handler)
 
 
-def setup_cors(app):
-    if cmd_opts.cors_allow_origins and cmd_opts.cors_allow_origins_regex:
-        app.add_middleware(CORSMiddleware, allow_origins=cmd_opts.cors_allow_origins.split(','), allow_origin_regex=cmd_opts.cors_allow_origins_regex, allow_methods=['*'], allow_credentials=True, allow_headers=['*'])
-    elif cmd_opts.cors_allow_origins:
-        app.add_middleware(CORSMiddleware, allow_origins=cmd_opts.cors_allow_origins.split(','), allow_methods=['*'], allow_credentials=True, allow_headers=['*'])
-    elif cmd_opts.cors_allow_origins_regex:
-        app.add_middleware(CORSMiddleware, allow_origin_regex=cmd_opts.cors_allow_origins_regex, allow_methods=['*'], allow_credentials=True, allow_headers=['*'])
+def load_model():
+    if opts.sd_checkpoint_autoload:
+        shared.state.begin('load model')
+        thread_model = Thread(target=lambda: shared.sd_model)
+        thread_model.start()
+        thread_refiner = Thread(target=lambda: shared.sd_refiner)
+        thread_refiner.start()
+        shared.state.end()
+        thread_model.join()
+        thread_refiner.join()
+    else:
+        log.debug('Model auto load disabled')
+    shared.opts.onchange("sd_model_checkpoint", wrap_queued_call(lambda: modules.sd_models.reload_model_weights(op='model')), call=False)
+    shared.opts.onchange("sd_model_refiner", wrap_queued_call(lambda: modules.sd_models.reload_model_weights(op='refiner')), call=False)
+    shared.opts.onchange("sd_model_dict", wrap_queued_call(lambda: modules.sd_models.reload_model_weights(op='dict')), call=False)
+    shared.opts.onchange("sd_vae", wrap_queued_call(lambda: modules.sd_vae.reload_vae_weights()), call=False)
+    shared.opts.onchange("sd_backend", wrap_queued_call(lambda: modules.sd_models.change_backend()), call=False)
+    timer.startup.record("checkpoint")
 
 
 def create_api(app):
+    log.debug('Creating API')
     from modules.api.api import Api
     api = Api(app, queue_lock)
+    from modules.api.nvml import nvml_api
+    nvml_api(api)
     return api
 
 
-def wait_on_server(demo=None):
-    while 1:
-        time.sleep(0.5)
-        if shared.state.need_restart:
-            shared.state.need_restart = False
-            time.sleep(0.5)
-            demo.close()
-            time.sleep(0.5)
-            break
+def async_policy():
+    _BasePolicy = asyncio.WindowsSelectorEventLoopPolicy if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy") else asyncio.DefaultEventLoopPolicy
+
+    class AnyThreadEventLoopPolicy(_BasePolicy):
+        def handle_exception(self, context):
+            msg = context.get("exception", context["message"])
+            log.error(f"AsyncIO loop: {msg}")
+
+        def get_event_loop(self) -> asyncio.AbstractEventLoop:
+            try:
+                self.loop = super().get_event_loop()
+            except (RuntimeError, AssertionError):
+                self.loop = self.new_event_loop()
+                self.set_event_loop(self.loop)
+            return self.loop
+
+        def __init__(self):
+            super().__init__()
+            self.loop = self.get_event_loop()
+            self.loop.set_exception_handler(self.handle_exception)
+            # log.debug(f"Event loop: {self.loop}")
+
+    asyncio.set_event_loop_policy(AnyThreadEventLoopPolicy())
 
 
-def api_only():
+def start_common():
+    log.debug('Entering start sequence')
+    logging.disable(logging.NOTSET if cmd_opts.debug else logging.DEBUG)
+    if shared.cmd_opts.data_dir is not None and len(shared.cmd_opts.data_dir) > 0:
+        log.info(f'Using data path: {shared.cmd_opts.data_dir}')
+    if shared.cmd_opts.models_dir is not None and len(shared.cmd_opts.models_dir) > 0 and shared.cmd_opts.models_dir != 'models':
+        log.info(f'Using models path: {shared.cmd_opts.models_dir}')
+    create_paths(opts)
+    async_policy()
     initialize()
-
-    app = FastAPI()
-    setup_cors(app)
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
-    api = create_api(app)
-
-    modules.script_callbacks.app_started_callback(None, app)
-
-    api.launch(server_name="0.0.0.0" if cmd_opts.listen else "127.0.0.1", port=cmd_opts.port if cmd_opts.port else 7861)
+    if shared.opts.clean_temp_dir_at_start:
+        ui_tempdir.cleanup_tmpdr()
+        timer.startup.record("cleanup")
 
 
-def webui():
-    launch_api = cmd_opts.api
-    initialize()
+def start_ui():
+    log.debug('Creating UI')
+    modules.script_callbacks.before_ui_callback()
+    timer.startup.record("before-ui")
+    shared.demo = modules.ui.create_ui(timer.startup)
+    timer.startup.record("ui")
+    if cmd_opts.disable_queue:
+        log.info('Server queues disabled')
+        shared.demo.progress_tracking = False
+    else:
+        shared.demo.queue(concurrency_count=64)
 
-    while 1:
-        if shared.opts.clean_temp_dir_at_start:
-            ui_tempdir.cleanup_tmpdr()
-
-        modules.script_callbacks.before_ui_callback()
-
-        shared.demo = modules.ui.create_ui()
-
-        if cmd_opts.gradio_queue:
-            shared.demo.queue(64)
-
-        gradio_auth_creds = []
-        if cmd_opts.gradio_auth:
-            gradio_auth_creds += cmd_opts.gradio_auth.strip('"').replace('\n', '').split(',')
-        if cmd_opts.gradio_auth_path:
-            with open(cmd_opts.gradio_auth_path, 'r', encoding="utf8") as file:
+    gradio_auth_creds = []
+    if cmd_opts.auth:
+        gradio_auth_creds += [x.strip() for x in cmd_opts.auth.strip('"').replace('\n', '').split(',') if x.strip()]
+    if cmd_opts.auth_file:
+        if not os.path.exists(cmd_opts.auth_file):
+            log.error(f"Invalid path to auth file: '{cmd_opts.auth_file}'")
+        else:
+            with open(cmd_opts.auth_file, 'r', encoding="utf8") as file:
                 for line in file.readlines():
-                    gradio_auth_creds += [x.strip() for x in line.split(',')]
+                    gradio_auth_creds += [x.strip() for x in line.split(',') if x.strip()]
 
-        app, local_url, share_url = shared.demo.launch(
+    global local_url # pylint: disable=global-statement
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        app, local_url, share_url = shared.demo.launch( # app is FastAPI(Starlette) instance
             share=cmd_opts.share,
             server_name=server_name,
-            server_port=cmd_opts.port,
+            server_port=cmd_opts.port if cmd_opts.port != 7860 else None,
             ssl_keyfile=cmd_opts.tls_keyfile,
             ssl_certfile=cmd_opts.tls_certfile,
-            debug=cmd_opts.gradio_debug,
+            ssl_verify=not cmd_opts.tls_selfsign,
+            debug=False,
             auth=[tuple(cred.split(':')) for cred in gradio_auth_creds] if gradio_auth_creds else None,
-            inbrowser=cmd_opts.autolaunch,
-            prevent_thread_lock=True
+            prevent_thread_lock=True,
+            max_threads=64,
+            show_api=False,
+            quiet=True,
+            favicon_path='html/logo.ico',
+            allowed_paths=[os.path.dirname(__file__), cmd_opts.data_dir],
+            app_kwargs=fastapi_args,
         )
-        # after initial launch, disable --autolaunch for subsequent restarts
-        cmd_opts.autolaunch = False
+    if cmd_opts.data_dir is not None:
+        ui_tempdir.register_tmp_file(shared.demo, os.path.join(cmd_opts.data_dir, 'x'))
+    shared.log.info(f'Local URL: {local_url}')
+    if cmd_opts.docs:
+        shared.log.info(f'API Docs: {local_url[:-1]}/docs') # pylint: disable=unsubscriptable-object
+    if share_url is not None:
+        shared.log.info(f'Share URL: {share_url}')
+    shared.log.debug(f'Gradio registered functions: {len(shared.demo.fns)}')
+    shared.demo.server.wants_restart = False
+    setup_middleware(app, cmd_opts)
 
-        # gradio uses a very open CORS policy via app.user_middleware, which makes it possible for
-        # an attacker to trick the user into opening a malicious HTML page, which makes a request to the
-        # running web ui and do whatever the attacker wants, including installing an extension and
-        # running its code. We disable this here. Suggested by RyotaK.
-        app.user_middleware = [x for x in app.user_middleware if x.cls.__name__ != 'CORSMiddleware']
+    if cmd_opts.subpath:
+        import gradio
+        gradio.mount_gradio_app(app, shared.demo, path=f"/{cmd_opts.subpath}")
+        shared.log.info(f'Redirector mounted: /{cmd_opts.subpath}')
 
-        setup_cors(app)
+    timer.startup.record("launch")
 
-        app.add_middleware(GZipMiddleware, minimum_size=1000)
+    modules.progress.setup_progress_api(app)
+    create_api(app)
+    timer.startup.record("api")
 
-        modules.progress.setup_progress_api(app)
+    ui_extra_networks.init_api(app)
 
-        if launch_api:
-            create_api(app)
+    modules.script_callbacks.app_started_callback(shared.demo, app)
+    timer.startup.record("app-started")
 
-        ui_extra_networks.add_pages_to_demo(app)
+    time_setup = [f'{k}:{round(v,3)}s' for (k,v) in modules.scripts.time_setup.items() if v > 0.005]
+    shared.log.debug(f'Scripts setup: {time_setup}')
+    time_component = [f'{k}:{round(v,3)}s' for (k,v) in modules.scripts.time_component.items() if v > 0.005]
+    if len(time_component) > 0:
+        shared.log.debug(f'Scripts components: {time_component}')
 
-        modules.script_callbacks.app_started_callback(shared.demo, app)
 
-        wait_on_server(shared.demo)
-        print('Restarting UI...')
-
-        sd_samplers.set_samplers()
-
+def webui(restart=False):
+    if restart:
+        modules.script_callbacks.app_reload_callback()
         modules.script_callbacks.script_unloaded_callback()
-        extensions.list_extensions()
 
-        localization.list_localizations(cmd_opts.localizations_dir)
+    start_common()
+    start_ui()
+    modules.sd_models.write_metadata()
+    load_model()
+    shared.opts.save(shared.config_filename)
+    log.info(f"Startup time: {timer.startup.summary()}")
+    timer.startup.reset()
 
-        modelloader.forbid_loaded_nonbuiltin_upscalers()
-        modules.scripts.reload_scripts()
-        modules.script_callbacks.model_loaded_callback(shared.sd_model)
-        modelloader.load_upscalers()
-
+    if not restart:
+        # override all loggers to use the same handlers as the main logger
+        for logger in [logging.getLogger(name) for name in logging.root.manager.loggerDict]: # pylint: disable=no-member
+            if logger.name.startswith('uvicorn') or logger.name.startswith('sd'):
+                continue
+            logger.handlers = log.handlers
+        # autolaunch only on initial start
+        if cmd_opts.autolaunch and local_url is not None:
+            cmd_opts.autolaunch = False
+            shared.log.info('Launching browser')
+            import webbrowser
+            webbrowser.open(local_url, new=2, autoraise=True)
+    else:
         for module in [module for name, module in sys.modules.items() if name.startswith("modules.ui")]:
             importlib.reload(module)
 
-        modules.sd_models.list_models()
+    return shared.demo.server
 
-        shared.reload_hypernetworks()
 
-        ui_extra_networks.intialize()
-        ui_extra_networks.register_page(ui_extra_networks_textual_inversion.ExtraNetworksPageTextualInversion())
-        ui_extra_networks.register_page(ui_extra_networks_hypernets.ExtraNetworksPageHypernetworks())
-        ui_extra_networks.register_page(ui_extra_networks_checkpoints.ExtraNetworksPageCheckpoints())
-
-        extra_networks.initialize()
-        extra_networks.register_extra_network(extra_networks_hypernet.ExtraNetworkHypernet())
+def api_only():
+    start_common()
+    from fastapi import FastAPI
+    app = FastAPI(**fastapi_args)
+    setup_middleware(app, cmd_opts)
+    api = create_api(app)
+    api.wants_restart = False
+    modules.script_callbacks.app_started_callback(None, app)
+    modules.sd_models.write_metadata()
+    log.info(f"Startup time: {timer.startup.summary()}")
+    server = api.launch()
+    return server
 
 
 if __name__ == "__main__":
-    if cmd_opts.nowebui:
+    if cmd_opts.api_only:
         api_only()
     else:
         webui()

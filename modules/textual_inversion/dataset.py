@@ -1,19 +1,16 @@
 import os
+import re
+import random
+from collections import defaultdict
 import numpy as np
 import PIL
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torchvision import transforms
-from collections import defaultdict
-from random import shuffle, choices
-
-import random
 import tqdm
-from modules import devices, shared
-import re
-
 from ldm.modules.distributions.distributions import DiagonalGaussianDistribution
+from modules import devices, shared
 
 re_numbers_at_start = re.compile(r"^[-\d]+\s*")
 
@@ -35,14 +32,10 @@ class PersonalizedBase(Dataset):
         re_word = re.compile(shared.opts.dataset_filename_word_regex) if len(shared.opts.dataset_filename_word_regex) > 0 else None
 
         self.placeholder_token = placeholder_token
-
         self.flip = transforms.RandomHorizontalFlip(p=flip_p)
-
         self.dataset = []
-
-        with open(template_file, "r") as file:
+        with open(template_file, "r", encoding="utf8") as file:
             lines = [x.strip() for x in file.readlines()]
-
         self.lines = lines
 
         assert data_root, 'dataset directory not specified'
@@ -50,20 +43,16 @@ class PersonalizedBase(Dataset):
         assert os.listdir(data_root), "Dataset directory is empty"
 
         self.image_paths = [os.path.join(data_root, file_path) for file_path in os.listdir(data_root)]
-
         self.shuffle_tags = shuffle_tags
         self.tag_drop_out = tag_drop_out
         groups = defaultdict(list)
-
-        print("Preparing dataset...")
+        shared.log.info(f"TI Training: Preparing dataset: {data_root}")
         for path in tqdm.tqdm(self.image_paths):
             alpha_channel = None
             if shared.state.interrupted:
-                raise Exception("interrupted")
+                raise RuntimeError("interrupted")
             try:
                 image = Image.open(path)
-                #Currently does not work for single color transparency
-                #We would need to read image.info['transparency'] for that
                 if use_weight and 'A' in image.getbands():
                     alpha_channel = image.getchannel('A')
                 image = image.convert('RGB')
@@ -72,7 +61,7 @@ class PersonalizedBase(Dataset):
             except Exception:
                 continue
 
-            text_filename = os.path.splitext(path)[0] + ".txt"
+            text_filename = f"{os.path.splitext(path)[0]}.txt"
             filename = os.path.basename(path)
 
             if os.path.exists(text_filename):
@@ -94,12 +83,9 @@ class PersonalizedBase(Dataset):
             with devices.autocast():
                 latent_dist = model.encode_first_stage(torchdata.unsqueeze(dim=0))
 
-            #Perform latent sampling, even for random sampling.
-            #We need the sample dimensions for the weights
             if latent_sampling_method == "deterministic":
                 if isinstance(latent_dist, DiagonalGaussianDistribution):
-                    # Works only for DiagonalGaussianDistribution
-                    latent_dist.std = 0
+                    latent_dist.std = torch.exp(0 * latent_dist.logvar)
                 else:
                     latent_sampling_method = "once"
             latent_sample = model.get_first_stage_encoding(latent_dist).squeeze().to(devices.cpu)
@@ -118,7 +104,7 @@ class PersonalizedBase(Dataset):
                 weight = torch.ones(latent_sample.shape)
             else:
                 weight = None
-            
+
             if latent_sampling_method == "random":
                 entry = DatasetEntry(filename=path, filename_text=filename_text, latent_dist=latent_dist, weight=weight)
             else:
@@ -193,16 +179,16 @@ class GroupedBatchSampler(Sampler):
         b = self.batch_size
 
         for g in self.groups:
-            shuffle(g)
+            random.shuffle(g)
 
         batches = []
         for g in self.groups:
             batches.extend(g[i*b:(i+1)*b] for i in range(len(g) // b))
         for _ in range(self.n_rand_batches):
-            rand_group = choices(self.groups, self.probs)[0]
-            batches.append(choices(rand_group, k=b))
+            rand_group = random.choices(self.groups, self.probs)[0]
+            batches.append(random.choices(rand_group, k=b))
 
-        shuffle(batches)
+        random.shuffle(batches)
 
         yield from batches
 
